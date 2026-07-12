@@ -1402,20 +1402,26 @@ class RealtimeSession:
         try:
             if self.local_asr is not None:
                 # Use local ASR engine (SenseVoiceSmall on GPU)
+                # transcribe_with_details() returns (text, emotion, event) separately
                 logger.info("[Mode A] Using local ASR engine for transcription")
-                transcript = await self.local_asr.transcribe(
+                asr_result = await self.local_asr.transcribe_with_details(
                     captured_pcm,
                     sample_rate=self.config.get("vad", "sample_rate", default=16000),
                     language=self.config.get("services", "asr", "language", default="zh"),
                 )
+                if asr_result:
+                    transcript, emotion, event = asr_result
+                else:
+                    transcript, emotion, event = "", "", ""
             else:
-                # Use remote ASR client
+                # Use remote ASR client (returns plain text, no emotion/event)
                 logger.info("[Mode A] Using remote ASR client for transcription")
                 transcript = await self.asr_client.transcribe_http(
                     captured_pcm,
                     sample_rate=self.config.get("vad", "sample_rate", default=16000),
                     language=self.config.get("services", "asr", "language", default="zh"),
                 )
+                emotion, event = "", ""
         except asyncio.CancelledError:
             # 被用户打断
             logger.info("[Session] Mode A ASR cancelled by interruption")
@@ -1425,12 +1431,39 @@ class RealtimeSession:
             await self.protocol.send_error("internal error")
             return
         
-        logger.info(f"ASR transcript: {transcript}")
+        # Build emotion context string for system prompt injection
+        # Key design: LLM should UNDERSTAND user emotion and respond appropriately
+        # (calming, empathetic, professional), NOT mimic the user's emotion.
+        # The wording must make this distinction clear to the LLM.
+        emotion_parts = []
+        if emotion and emotion != "<|EMO_UNKNOWN|>":
+            # Convert tag to readable label: <|HAPPY|> -> HAPPY
+            emo_label = emotion.strip("<|>").replace("EMO_", "")
+            # CRITICAL: Frame as "user state info" + explicit instruction not to mimic
+            emotion_parts.append(
+                f"当前用户情绪状态为{emo_label}，请结合你的人设进行回应。"
+            )
+        if event:
+            evt_label = event.strip("<|>")
+            emotion_parts.append(f"检测到语音事件: {evt_label}")
+        emotion_context = "；".join(emotion_parts) if emotion_parts else ""
         
+        logger.info(f"ASR transcript: {transcript}, emotion: {emotion}, event: {event}, context: {emotion_context}")
+        
+        # Send clean text (without tags) to client transcript
         if transcript:
             await self.protocol.send_input_transcript(transcript)
         
-        messages = self._build_omni_messages(transcript, is_audio=False, captured_images=captured_images)
+        # Append user message to conversation history (for context continuity)
+        if transcript and not self.session_config.tools:
+            self.conversation.append({"role": "user", "content": transcript})
+        
+        # Pass clean text to LLM, emotion/event via system prompt
+        messages = self._build_omni_messages(
+            transcript, is_audio=False,
+            emotion_context=emotion_context,
+            captured_images=captured_images,
+        )
         
         resp_id = await self.protocol.send_response_created()
         self._current_resp_id = resp_id
@@ -1518,17 +1551,32 @@ class RealtimeSession:
                 self._active_pipeline_task = None
             self.interruption.set_generating(False)
 
-    def _build_base_messages(self) -> list[dict]:
-        """Build base messages (system + conversation history) shared by all modes."""
+    def _build_base_messages(self, emotion_context: str = "") -> list[dict]:
+        """Build base messages (system + conversation history) shared by all modes.
+        
+        Args:
+            emotion_context: Optional emotion/event context string to append to
+                system prompt, e.g. "用户情绪: HAPPY；语音事件: Speech".
+                This allows the LLM to perceive user emotion without seeing
+                raw tags in the user message text.
+        """
         messages = []
         
-        if self.session_config.instructions:
+        # Build system content: base instructions + emotion context
+        system_content = self.session_config.instructions or ""
+        if emotion_context:
+            if system_content:
+                system_content += f"\n[{emotion_context}]"
+            else:
+                system_content = f"[{emotion_context}]"
+        
+        if system_content:
             messages.append({
                 "role": "system",
-                "content": self.session_config.instructions,
+                "content": system_content,
             })
         
-        for msg in self.conversation[-10:]:
+        for msg in self.conversation[-20:]:
             role = msg.get("role", "user")
             content = msg.get("content", "")
             
@@ -1565,15 +1613,16 @@ class RealtimeSession:
         
         return messages
 
-    def _build_omni_messages(self, audio_or_text: str, is_audio: bool, captured_images: list[str] | None = None) -> list[dict]:
+    def _build_omni_messages(self, audio_or_text: str, is_audio: bool, emotion_context: str = "", captured_images: list[str] | None = None) -> list[dict]:
         """Build messages for Omni API call.
         
         Args:
             audio_or_text: WAV base64 (is_audio=True) 或文本 (is_audio=False)
             is_audio: 是否为音频输入
+            emotion_context: Optional emotion/event context to inject into system prompt
             captured_images: 已保存的图片数据（避免从已清空的audio_buffer取）
         """
-        messages = self._build_base_messages()
+        messages = self._build_base_messages(emotion_context=emotion_context)
         
         user_content = []
         

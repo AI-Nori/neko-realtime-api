@@ -12,7 +12,6 @@ Model download:
 import asyncio
 import logging
 import os
-import re
 from typing import Optional
 
 import numpy as np
@@ -73,10 +72,36 @@ def _ensure_model_downloaded(model_id: str, target_dir: str, required_files: lis
         raise
 
 
-def _clean_text(text: str) -> str:
-    """Clean SenseVoice output by removing special markers like <|...|>."""
-    text = re.sub(r'<\|.*?\|>', '', text)
-    return text.strip()
+def _build_prefixed_text(text: str, emotion: str, event: str) -> str:
+    """Build text with emotion and event tags prefixed.
+
+    sherpa-onnx SenseVoice result.text is already clean (no <|...|> markers),
+    so no cleaning is needed. This function prepends emotion and event tags
+    to make downstream consumers (LLM, TTS, etc.) aware of emotion/event context.
+
+    Filtering: <|EMO_UNKNOWN|> is skipped (no information value).
+    All other tags (including <|Speech|>) are preserved per user preference.
+
+    Examples:
+        <|HAPPY|><|Speech|>今天天气真好。
+        <|HAPPY|><|Laughter|>太有意思了。
+        <|Speech|>今天的会议定在下午3点。
+        <|Laughter|>哈哈哈。
+
+    Args:
+        text: Clean transcription text from result.text.
+        emotion: Raw emotion tag, e.g. '<|HAPPY|>'. May be empty string.
+        event: Raw event tag, e.g. '<|Speech|>'. May be empty string.
+
+    Returns:
+        Text with tags prefixed, e.g. '<|HAPPY|><|Speech|>文本内容'.
+    """
+    prefix = ""
+    if emotion and emotion != "<|EMO_UNKNOWN|>":
+        prefix += emotion
+    if event:
+        prefix += event
+    return prefix + text
 
 
 class LocalASREngine:
@@ -205,7 +230,10 @@ class LocalASREngine:
         sample_rate: int = 16000,
         language: str = "auto",
     ) -> str:
-        """Transcribe PCM audio bytes to text.
+        """Transcribe PCM audio bytes to text with emotion/event tags prefixed.
+
+        DEPRECATED: This method is kept for backward compatibility.
+        Use transcribe_with_details() instead to get (text, emotion, event) separately.
 
         Args:
             pcm_bytes: Raw PCM audio data (int16, mono).
@@ -213,7 +241,44 @@ class LocalASREngine:
             language: Language code for transcription (default: "auto").
 
         Returns:
-            Transcribed text string, or empty string on failure.
+            Text with emotion and event tags prefixed, e.g.:
+                '<|HAPPY|><|Speech|>今天天气真好。'
+            <|EMO_UNKNOWN|> is filtered out; all other tags are preserved.
+            Returns empty string on failure.
+        """
+        details = await self.transcribe_with_details(pcm_bytes, sample_rate, language)
+        if details:
+            text, emotion, event = details
+            return _build_prefixed_text(text, emotion, event)
+        return ""
+
+    async def transcribe_with_details(
+        self,
+        pcm_bytes: bytes,
+        sample_rate: int = 16000,
+        language: str = "auto",
+    ) -> tuple[str, str, str] | None:
+        """Transcribe PCM audio bytes and return detailed results.
+
+        Returns a tuple of (text, emotion, event) separately, allowing callers to:
+        - Send clean text to LLM (without tags in user message)
+        - Send clean text to client transcript (without tags)
+        - Inject emotion/event context into system prompt
+
+        This is the preferred method for integrations that need to separate
+        the transcription text from its emotion/event metadata.
+
+        Args:
+            pcm_bytes: Raw PCM audio data (int16, mono).
+            sample_rate: Sample rate of the input audio.
+            language: Language code for transcription (default: "auto").
+
+        Returns:
+            Tuple of (text, emotion, event) where:
+            - text: Clean transcription text without any tags
+            - emotion: Emotion tag like '<|HAPPY|>' or empty string
+            - event: Event tag like '<|Speech|>' or empty string
+            Returns None on failure.
         """
         # Convert int16 PCM bytes to float32 numpy array
         audio_int16 = np.frombuffer(pcm_bytes, dtype=np.int16)
@@ -241,25 +306,27 @@ class LocalASREngine:
                 )
             except Exception as e:
                 logger.error(f"[LocalASR] Inference error: {e}", exc_info=True)
-                return ""
+                return None
 
-        # Parse result
-        if result:
-            cleaned = _clean_text(result)
-            return cleaned
+        # Return the tuple directly: (text, emotion, event)
+        return result if result else None
 
-        return ""
-
-    def _decode(self, audio_float: np.ndarray) -> str:
+    def _decode(self, audio_float: np.ndarray) -> tuple[str, str, str]:
         """Synchronous decode method for run_in_executor.
+
+        sherpa-onnx SenseVoice result fields:
+            - result.text:    Clean text (no <|...|> markers)
+            - result.emotion: Emotion tag like '<|HAPPY|>' (may be empty)
+            - result.event:   Event tag like '<|Speech|>' or '<|Laughter|>'
 
         Args:
             audio_float: float32 numpy array, values in [-1, 1].
 
         Returns:
-            Raw recognition text (may contain <|...|> markers).
+            Tuple of (text, emotion, event). emotion/event may be empty strings.
         """
         stream = self._recognizer.create_stream()
         stream.accept_waveform(_TARGET_SAMPLE_RATE, audio_float)
         self._recognizer.decode_stream(stream)
-        return stream.result.text
+        result = stream.result
+        return result.text, result.emotion or "", result.event or ""
