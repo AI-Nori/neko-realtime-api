@@ -234,6 +234,11 @@ Omni API 兼容 OpenAI Chat Completions 接口格式，TTS API 兼容 OpenAI Spe
 
 ## 更新记录
 
+### 2026-07-12
+
+- 本地 ASR 增加 SenseVoice 情绪标签识别与注入
+- 修复会话上下文只存储 assistant 消息的问题
+
 ### 2026-06-16
 
 - **新增 HTTP ASR 端点**：`POST /v1/audio/transcriptions`，OpenAI Whisper 协议兼容
