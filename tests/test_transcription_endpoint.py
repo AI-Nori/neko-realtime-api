@@ -147,3 +147,30 @@ def test_empty_payload_returns_400(reset_config, monkeypatch) -> None:
         files={"file": ("audio.wav", b"", "audio/wav")},
     )
     assert resp.status_code == 400, resp.text
+
+
+def test_oversize_upload_returns_413(reset_config, monkeypatch) -> None:
+    """超过 security.max_upload_bytes 的上传 → 413（防超大上传耗尽内存）。
+
+    上传体小于 Content-Length 预检余量（1MB），因此本用例走的是
+    分块读取路径中的实际字节计数限制，而非头部预检。
+    """
+    _install_config(
+        monkeypatch,
+        **{
+            "security.auth_enabled": False,
+            "realtime_server.auth_enabled": False,
+            "services.asr.local_asr": False,
+            "services.asr.base_url": None,
+            "security.max_upload_bytes": 1024,
+        },
+    )
+    app = _make_app()
+    client = TestClient(app)
+    wav_bytes = _make_silence_wav()  # ~16KB，远超 1024 上限
+
+    resp = client.post(
+        "/v1/audio/transcriptions",
+        files={"file": ("audio.wav", wav_bytes, "audio/wav")},
+    )
+    assert resp.status_code == 413, resp.text

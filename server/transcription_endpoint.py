@@ -34,6 +34,10 @@ logger = logging.getLogger("realtime-server")
 
 _TARGET_SAMPLE_RATE = 16000
 
+# 上传分块读取大小 / Content-Length 预检余量（multipart 边界与表单字段开销）
+_CHUNK_READ_BYTES = 1024 * 1024
+_UPLOAD_SLACK_BYTES = 1024 * 1024
+
 
 def warmup_audio_pipeline() -> None:
     """启动时预热 soundfile 解码 + librosa.resample 流水线。
@@ -243,6 +247,7 @@ def register_transcription_routes(app: FastAPI) -> None:
     """
     config = ServerConfig.load()
     auth_enabled, auth_token = _resolve_auth_settings(config)
+    max_upload_bytes = int(config.get("security", "max_upload_bytes", default=50 * 1024 * 1024))
     local_enabled = bool(config.get("services", "asr", "local_asr", default=False))
     remote_base_url = config.get("services", "asr", "base_url", default=None)
     remote_timeout_s = int(config.get("services", "asr", "timeout_s", default=10))
@@ -262,9 +267,30 @@ def register_transcription_routes(app: FastAPI) -> None:
         """
         _check_bearer_auth(request, auth_enabled, auth_token)
 
-        # 读取并解码音频
+        # 读取上传音频：分块读取并限制总大小，防止超大上传耗尽内存
+        raw_cl = request.headers.get("content-length")
+        if raw_cl:
+            try:
+                content_length = int(raw_cl)
+            except ValueError:
+                content_length = None
+            if content_length is not None and content_length > max_upload_bytes + _UPLOAD_SLACK_BYTES:
+                raise HTTPException(status_code=413, detail="Upload exceeds maximum allowed size")
+
         try:
-            content = await file.read()
+            parts: list[bytes] = []
+            total = 0
+            while True:
+                chunk = await file.read(_CHUNK_READ_BYTES)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > max_upload_bytes:
+                    raise HTTPException(status_code=413, detail="Upload exceeds maximum allowed size")
+                parts.append(chunk)
+            content = b"".join(parts)
+        except HTTPException:
+            raise
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Failed to read upload: {e}")
 
