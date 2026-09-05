@@ -174,3 +174,35 @@ def test_oversize_upload_returns_413(reset_config, monkeypatch) -> None:
         files={"file": ("audio.wav", wav_bytes, "audio/wav")},
     )
     assert resp.status_code == 413, resp.text
+
+
+def test_oversize_rejected_before_auth_and_parsing(reset_config, monkeypatch) -> None:
+    """超大请求体必须在认证与 multipart 解析之前被拒绝 → 413。
+
+    开启认证且不携带 Bearer：若超大检查仍发生在 endpoint 内部
+    （认证之后、multipart 解析之后），本用例会先得到 401；修复后
+    HTTP middleware 读取 Content-Length 即拒绝，直接返回 413。
+    """
+    _install_config(
+        monkeypatch,
+        **{
+            "security.auth_enabled": True,
+            "realtime_server.auth_enabled": True,
+            "security.auth_token": "secret-token",
+            "services.asr.local_asr": False,
+            "services.asr.base_url": None,
+            "security.max_upload_bytes": 1024,
+        },
+    )
+    app = _make_app()
+    client = TestClient(app)
+    # 1MB+1KB+1 字节，超过 1024 上限 + 1MB Content-Length 预检余量
+    big_payload = b"x" * (1024 + 1024 * 1024 + 1)
+
+    resp = client.post(
+        "/v1/audio/transcriptions",
+        files={"file": ("audio.wav", big_payload, "audio/wav")},
+        # 故意不携带 Authorization 头
+    )
+    assert resp.status_code == 413, resp.text
+    assert "Upload exceeds maximum allowed size" in resp.json().get("detail", "")

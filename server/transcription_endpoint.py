@@ -27,6 +27,7 @@ from typing import Optional
 
 import numpy as np
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.responses import JSONResponse
 
 from .config import ServerConfig
 
@@ -251,6 +252,32 @@ def register_transcription_routes(app: FastAPI) -> None:
     local_enabled = bool(config.get("services", "asr", "local_asr", default=False))
     remote_base_url = config.get("services", "asr", "base_url", default=None)
     remote_timeout_s = int(config.get("services", "asr", "timeout_s", default=10))
+
+    @app.middleware("http")
+    async def reject_oversized_uploads(request: Request, call_next):
+        """在 multipart 解析与认证之前拒绝超大请求体（P1 纵深防御）。
+
+        FastAPI 的 File(...) 依赖项在进入 endpoint 函数体之前就已把整个
+        multipart body 读进内存，endpoint 内部的 Content-Length 预检与
+        分块计数都发生在解析之后，挡不住解析本身带来的内存/带宽消耗。
+        本 middleware 只对 POST /v1/audio/transcriptions 生效：仅读
+        Content-Length 头即可判定，无 body 读取，开销极小。分块大小限制
+        仍保留在 endpoint 内部作为纵深防御（覆盖 chunked 传输编码等
+        无 Content-Length 的场景）。
+        """
+        if request.method == "POST" and request.url.path == "/v1/audio/transcriptions":
+            raw_cl = request.headers.get("content-length")
+            if raw_cl:
+                try:
+                    content_length = int(raw_cl)
+                except ValueError:
+                    content_length = None
+                if content_length is not None and content_length > max_upload_bytes + _UPLOAD_SLACK_BYTES:
+                    return JSONResponse(
+                        status_code=413,
+                        content={"detail": "Upload exceeds maximum allowed size"},
+                    )
+        return await call_next(request)
 
     @app.post("/v1/audio/transcriptions")
     async def transcribe_endpoint(  # noqa: D401 - FastAPI route

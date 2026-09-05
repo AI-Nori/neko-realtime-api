@@ -1454,18 +1454,21 @@ class RealtimeSession:
         if transcript:
             await self.protocol.send_input_transcript(transcript)
         
-        # Append user message to conversation history (for context continuity).
-        # tools 开启时同样要记录，否则 tool loop 只回写 assistant/tool 消息，
-        # 后续轮次的历史里会缺失所有用户发言。
-        if transcript:
-            self.conversation.append({"role": "user", "content": transcript})
-        
         # Pass clean text to LLM, emotion/event via system prompt
+        # 先基于现有历史构建 messages，再追加本次转录到 conversation：
+        # _build_base_messages 会展开 self.conversation 历史，若先 append
+        # 再构建，同一句转录会在发给 LLM 的 messages 中出现两次。
         messages = self._build_omni_messages(
             transcript, is_audio=False,
             emotion_context=emotion_context,
             captured_images=captured_images,
         )
+        
+        # Append user message to conversation history (for context continuity).
+        # tools 开启时同样要记录，否则 tool loop 只回写 assistant/tool 消息，
+        # 后续轮次的历史里会缺失所有用户发言。
+        if transcript:
+            self.conversation.append({"role": "user", "content": transcript})
         
         resp_id = await self.protocol.send_response_created()
         self._current_resp_id = resp_id
