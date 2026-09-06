@@ -86,8 +86,14 @@ class _FakeConfig:
         return default
 
 
-def _make_session(captured_messages: list):
-    """构建最小 RealtimeSession 桩并绑定真实方法。"""
+def _make_session(captured_messages: list, tools: list[dict] | None = None):
+    """构建最小 RealtimeSession 桩并绑定真实方法。
+
+    Args:
+        captured_messages: 捕获发给 LLM 的 messages 的列表。
+        tools: 透传给 session_config.tools 的工具定义（None=关闭
+            tool loop），用于覆盖 tools 开启时的会话历史行为。
+    """
     fake = SimpleNamespace()
     fake.protocol = _FakeProtocol()
     fake.local_asr = _FakeLocalASR()
@@ -96,7 +102,7 @@ def _make_session(captured_messages: list):
     fake.omni_client = _FakeOmniClient()
     fake.conversation = [{"role": "user", "content": "上一轮的提问"}]
     fake.session_config = SimpleNamespace(
-        tools=None,
+        tools=tools,
         instructions="你是一个助手",
         _model="test-model",
     )
@@ -183,4 +189,39 @@ async def test_conversation_history_order_after_mode_a():
         {"role": "user", "content": "上一轮的提问"},
         {"role": "user", "content": "今天天气怎么样"},
         {"role": "assistant", "content": "今天天气晴朗"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_transcript_retained_with_tools_enabled():
+    """tools 开启时本次用户转录仍必须进入会话历史。
+
+    回归场景：曾有 ``if transcript and not self.session_config.tools``
+    的守卫，导致 tool loop 会话的历史里缺失所有用户发言
+    （tool loop 只回写 assistant/tool 消息）。本用例在 tools 开启
+    且 tool loop 正常接管 assistant 回写的情况下，断言当前用户
+    转录按序保留。
+    """
+    captured: list = []
+    tools = [{
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "查询天气",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    }]
+    fake = _make_session(captured, tools=tools)
+
+    await fake._process_mode_a(b"\x00" * 3200, duration_ms=100.0)
+
+    # 本次转录恰好出现一次（tools 路径同样不得重复）
+    flat = _flatten_messages(captured[0])
+    assert flat.count("今天天气怎么样") == 1, (
+        f"tools 开启时本次转录不应重复出现: {flat}"
+    )
+    # tool loop 接管 assistant 回写（full_text and not tools → 不追加）
+    assert fake.conversation == [
+        {"role": "user", "content": "上一轮的提问"},
+        {"role": "user", "content": "今天天气怎么样"},
     ]

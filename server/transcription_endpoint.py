@@ -35,9 +35,13 @@ logger = logging.getLogger("realtime-server")
 
 _TARGET_SAMPLE_RATE = 16000
 
-# 上传分块读取大小 / Content-Length 预检余量（multipart 边界与表单字段开销）
+# 上传分块读取大小 / Content-Length 预检余量。
+# _UPLOAD_SLACK_BYTES 仅覆盖 multipart 元数据开销（边界行 + Content-Disposition
+# 等头部 + 表单字段），上限 2KB：预检必须把文件内容部分限制在
+# security.max_upload_bytes 之内；无 Content-Length 的 chunked 传输由
+# endpoint 内分块读取的字节计数兜底。
 _CHUNK_READ_BYTES = 1024 * 1024
-_UPLOAD_SLACK_BYTES = 1024 * 1024
+_UPLOAD_SLACK_BYTES = 2 * 1024
 
 
 def warmup_audio_pipeline() -> None:
